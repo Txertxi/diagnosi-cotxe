@@ -2,460 +2,519 @@ package cat.sergibonet.diagnosi
 
 import android.Manifest
 import android.app.Activity
-import android.content.ClipData
-import android.content.ClipboardManager
+import android.app.AlertDialog
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
-import android.content.pm.ResolveInfo
-import android.content.res.Configuration
 import android.graphics.Color
 import android.graphics.Typeface
+import android.graphics.drawable.GradientDrawable
+import android.graphics.drawable.StateListDrawable
 import android.hardware.Sensor
 import android.hardware.SensorEvent
 import android.hardware.SensorEventListener
 import android.hardware.SensorManager
-import android.location.GnssStatus
-import android.location.Location
-import android.location.LocationListener
-import android.location.LocationManager
-import android.media.session.MediaSession
-import android.media.session.PlaybackState
-import android.os.Build
 import android.os.Bundle
-import android.os.SystemClock
-import android.view.InputDevice
-import android.view.KeyEvent
+import android.util.TypedValue
+import android.view.Gravity
+import android.view.View
+import android.view.ViewGroup
 import android.view.WindowManager
+import android.widget.ArrayAdapter
 import android.widget.Button
+import android.widget.FrameLayout
 import android.widget.LinearLayout
+import android.widget.ListView
 import android.widget.ScrollView
 import android.widget.TextView
 import android.widget.Toast
-import java.text.SimpleDateFormat
-import java.util.Date
-import java.util.Locale
 
 /**
- * Diagnosi per a la unitat Android del cotxe.
- * Quatre pestanyes: Tecles (volant), GPS, Apps instal·lades i Sistema.
+ * Tauler del cotxe: quatre pàgines (Conducció, Viatge, Sensors, Ajustaments)
+ * i una barra inferior amb botons grans per obrir altres apps.
  */
-class MainActivity : Activity() {
+class MainActivity : Activity(), SensorEventListener {
 
-    private companion object {
-        const val TAB_KEYS = 0
-        const val TAB_GPS = 1
-        const val TAB_APPS = 2
-        const val TAB_SYS = 3
-        const val REQ_LOCATION = 1
-        const val MAX_LOG = 30000
-        const val KEYS_HINT =
-            "Prem els botons del volant (volum, track+, track-, mode...),\n" +
-            "els de sota el volant i els de la propia unitat.\n" +
-            "Cada pulsacio apareixera aqui, la mes recent a dalt.\n\n" +
-            "[TECLA]        = tecla rebuda per l'app en primer pla\n" +
-            "[MEDIASESSION] = boto multimedia rebut a traves del sistema\n"
-    }
+    private class AppEntry(val label: String, val pkg: String, val cls: String)
 
-    private val keysLog = StringBuilder()
-    private var appsText = ""
-    private var sysText = ""
-    private var tab = TAB_KEYS
-    private var lastRender = 0L
-
-    private var lastLoc: Location? = null
-    private var satVisible = 0
-    private var satUsed = 0
-    private var gpsStarted = false
-    private var gpsError = ""
-    private var azimuth: Float? = null
-    private var hasRotationSensor = false
-
-    private var mediaSession: MediaSession? = null
-    private lateinit var textView: TextView
+    private val tabNames = arrayOf("Conducció", "Viatge", "Sensors", "Ajustaments")
     private val tabButtons = ArrayList<Button>()
+    private val slotButtons = ArrayList<Button>()
+    private lateinit var pages: Array<View>
+    private lateinit var settingsRoot: ScrollView
+    private var current = 0
+
+    // Peces de la pantalla d'ajustaments que s'han d'actualitzar.
+    private lateinit var altInfo: TextView
+    private lateinit var gpsInfo: TextView
+    private lateinit var swapBtn: Button
+    private lateinit var invFwdBtn: Button
+    private lateinit var invLatBtn: Button
+    private val slotRowButtons = ArrayList<Button>()
+
+    private var sensorManager: SensorManager? = null
 
     // ------------------------------------------------------------------ cicle de vida
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        Prefs.init(this)
+        GpsHub.restore()
+        applyDefaults()
+        AccelHub.loadSettings()
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
-        buildUi()
-        appsText = buildApps()
-        sysText = buildSystem()
-        setupMediaSession()
-        if (checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION) != PackageManager.PERMISSION_GRANTED) {
-            requestPermissions(arrayOf(Manifest.permission.ACCESS_FINE_LOCATION), REQ_LOCATION)
-        }
-        showTab(TAB_KEYS)
+        setContentView(buildUi())
+        selectTab(0)
+        ensureGps()
     }
 
     override fun onResume() {
         super.onResume()
-        startGps()
+        GpsHub.permissionOk = hasLocationPermission()
+        if (GpsHub.permissionOk && !GpsHub.serviceRunning) startGpsService()
         val sm = getSystemService(Context.SENSOR_SERVICE) as SensorManager
-        val rv = sm.getDefaultSensor(Sensor.TYPE_ROTATION_VECTOR)
-        hasRotationSensor = rv != null
-        if (rv != null) sm.registerListener(sensorListener, rv, SensorManager.SENSOR_DELAY_UI)
+        sensorManager = sm
+        val acc = sm.getDefaultSensor(Sensor.TYPE_ACCELEROMETER)
+        AccelHub.available = acc != null
+        AccelHub.resetClock()
+        if (acc != null) sm.registerListener(this, acc, SensorManager.SENSOR_DELAY_UI)
+        if (current == TAB_SETTINGS) refreshSettings()
     }
 
     override fun onPause() {
         super.onPause()
-        stopGps()
-        val sm = getSystemService(Context.SENSOR_SERVICE) as SensorManager
-        sm.unregisterListener(sensorListener)
-    }
-
-    override fun onDestroy() {
-        super.onDestroy()
-        mediaSession?.release()
-        mediaSession = null
+        sensorManager?.unregisterListener(this)
+        GpsHub.persist()
     }
 
     override fun onRequestPermissionsResult(
-        requestCode: Int,
-        permissions: Array<out String>,
-        grantResults: IntArray
+        requestCode: Int, permissions: Array<out String>, grantResults: IntArray
     ) {
         super.onRequestPermissionsResult(requestCode, permissions, grantResults)
-        if (requestCode == REQ_LOCATION) {
-            startGps()
-            requestRender()
+        GpsHub.permissionOk = hasLocationPermission()
+        if (GpsHub.permissionOk) startGpsService()
+        if (current == TAB_SETTINGS) refreshSettings()
+    }
+
+    override fun onSensorChanged(event: SensorEvent) {
+        if (event.sensor.type == Sensor.TYPE_ACCELEROMETER) {
+            AccelHub.onValues(
+                event.values[0].toDouble(), event.values[1].toDouble(),
+                event.values[2].toDouble(), event.timestamp
+            )
         }
     }
 
-    // ------------------------------------------------------------------ interficie
+    override fun onAccuracyChanged(sensor: Sensor?, accuracy: Int) {}
 
-    private fun buildUi() {
+    // ------------------------------------------------------------------ GPS i permisos
+
+    private fun hasLocationPermission(): Boolean =
+        checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED
+
+    private fun ensureGps() {
+        GpsHub.permissionOk = hasLocationPermission()
+        if (GpsHub.permissionOk) {
+            startGpsService()
+        } else {
+            requestPermissions(arrayOf(Manifest.permission.ACCESS_FINE_LOCATION), REQ_LOCATION)
+        }
+    }
+
+    private fun startGpsService() {
+        try {
+            startForegroundService(Intent(this, GpsService::class.java))
+        } catch (e: Exception) {
+            Toast.makeText(this, "No s'ha pogut engegar el GPS: ${e.message}", Toast.LENGTH_LONG).show()
+        }
+    }
+
+    // ------------------------------------------------------------------ construcció de la pantalla
+
+    private fun dp(v: Float): Int = (v * resources.displayMetrics.density + 0.5f).toInt()
+
+    private fun roundBg(normal: Int, pressed: Int): StateListDrawable {
+        val radius = dp(14f).toFloat()
+        val n = GradientDrawable()
+        n.setColor(normal)
+        n.cornerRadius = radius
+        val p = GradientDrawable()
+        p.setColor(pressed)
+        p.cornerRadius = radius
+        val s = StateListDrawable()
+        s.addState(intArrayOf(android.R.attr.state_pressed), p)
+        s.addState(intArrayOf(), n)
+        return s
+    }
+
+    private fun makeButton(text: String, sp: Float, normal: Int, pressed: Int, textColor: Int): Button {
+        val b = Button(this)
+        b.text = text
+        b.isAllCaps = false
+        b.typeface = Typeface.DEFAULT_BOLD
+        b.setTextSize(TypedValue.COMPLEX_UNIT_SP, sp)
+        b.setTextColor(textColor)
+        b.background = roundBg(normal, pressed)
+        b.minHeight = 0
+        b.minimumHeight = 0
+        b.minWidth = 0
+        b.minimumWidth = 0
+        b.maxLines = 2
+        b.setPadding(dp(4f), 0, dp(4f), 0)
+        return b
+    }
+
+    private fun weightParams(): LinearLayout.LayoutParams {
+        val lp = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.MATCH_PARENT, 1f)
+        lp.setMargins(dp(4f), dp(4f), dp(4f), dp(4f))
+        return lp
+    }
+
+    private fun buildUi(): View {
         val root = LinearLayout(this)
         root.orientation = LinearLayout.VERTICAL
         root.setBackgroundColor(Color.BLACK)
 
-        val bar = LinearLayout(this)
-        bar.orientation = LinearLayout.HORIZONTAL
-
-        val names = arrayOf("Tecles", "GPS", "Apps", "Sistema")
-        for (i in names.indices) {
-            val b = Button(this)
-            b.text = names[i]
-            b.textSize = 20f
-            b.setOnClickListener { showTab(i) }
-            bar.addView(b, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
+        // Pestanyes de dalt
+        val tabs = LinearLayout(this)
+        tabs.orientation = LinearLayout.HORIZONTAL
+        for (i in tabNames.indices) {
+            val b = makeButton(tabNames[i], 24f, Pal.BUTTON, Pal.BUTTON_PRESSED, Color.WHITE)
+            b.setOnClickListener { selectTab(i) }
+            tabs.addView(b, weightParams())
             tabButtons.add(b)
         }
+        root.addView(tabs, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(64f)))
 
-        val clear = Button(this)
-        clear.text = "Esborra"
-        clear.textSize = 20f
-        clear.setOnClickListener {
-            keysLog.setLength(0)
-            render()
+        // Pàgines
+        val drive = DrivePage(this)
+        val trip = TripPage(this)
+        trip.onReset = { confirmResetTrip() }
+        val sensors = SensorsPage(this)
+        sensors.onCalibrate = { calibrateLevel() }
+        settingsRoot = buildSettings()
+        pages = arrayOf(drive, trip, sensors, settingsRoot)
+
+        val content = FrameLayout(this)
+        for (p in pages) {
+            content.addView(p, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
         }
-        bar.addView(clear, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
+        root.addView(content, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f))
 
-        val copy = Button(this)
-        copy.text = "Copia"
-        copy.textSize = 20f
-        copy.setOnClickListener { copyReport() }
-        bar.addView(copy, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
+        // Barra de botons d'apps
+        val bar = LinearLayout(this)
+        bar.orientation = LinearLayout.HORIZONTAL
+        for (i in 0 until Prefs.SLOTS) {
+            val b = makeButton(Prefs.SLOT_NAMES[i], 24f, Pal.BUTTON, Pal.BUTTON_PRESSED, Color.WHITE)
+            b.setOnClickListener { launchSlot(i) }
+            b.setOnLongClickListener {
+                chooseApp(i)
+                true
+            }
+            bar.addView(b, weightParams())
+            slotButtons.add(b)
+        }
+        val home = makeButton("Inici", 24f, 0xFF1D4E89.toInt(), 0xFF2F6DB8.toInt(), Color.WHITE)
+        home.setOnClickListener { goHome() }
+        bar.addView(home, weightParams())
+        root.addView(bar, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(104f)))
 
-        val share = Button(this)
-        share.text = "Comparteix"
-        share.textSize = 20f
-        share.setOnClickListener { shareReport() }
-        bar.addView(share, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
-
-        textView = TextView(this)
-        textView.setTextColor(Color.rgb(120, 255, 120))
-        textView.typeface = Typeface.MONOSPACE
-        textView.textSize = 18f
-        textView.setPadding(24, 16, 24, 16)
-
-        val scroll = ScrollView(this)
-        scroll.addView(textView)
-
-        root.addView(
-            bar,
-            LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT,
-                LinearLayout.LayoutParams.WRAP_CONTENT
-            )
-        )
-        root.addView(
-            scroll,
-            LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f)
-        )
-        setContentView(root)
+        return root
     }
 
-    private fun showTab(index: Int) {
-        tab = index
+    private fun selectTab(i: Int) {
+        current = i
+        for (j in pages.indices) {
+            pages[j].visibility = if (j == i) View.VISIBLE else View.GONE
+        }
         for (j in tabButtons.indices) {
-            tabButtons[j].alpha = if (j == index) 1f else 0.55f
+            val sel = j == i
+            tabButtons[j].background = if (sel) roundBg(Pal.AMBER, Pal.AMBER) else roundBg(Pal.BUTTON, Pal.BUTTON_PRESSED)
+            tabButtons[j].setTextColor(if (sel) Color.BLACK else Color.WHITE)
         }
-        render()
+        if (i == TAB_SETTINGS) refreshSettings()
     }
 
-    private fun render() {
-        val text = when (tab) {
-            TAB_KEYS -> if (keysLog.isEmpty()) KEYS_HINT else keysLog.toString()
-            TAB_GPS -> buildGpsText()
-            TAB_APPS -> appsText
-            else -> sysText
+    // ------------------------------------------------------------------ botons d'apps
+
+    private fun applyDefaults() {
+        if (Prefs.defaultsDone) return
+        val defaults = mapOf(
+            3 to "com.google.android.apps.maps",
+            4 to "com.spotify.music",
+            5 to "com.google.android.projection.gearhead"
+        )
+        for ((slot, pkg) in defaults) {
+            val cn = packageManager.getLaunchIntentForPackage(pkg)?.component
+            if (cn != null) Prefs.setSlot(slot, cn.packageName, cn.className)
         }
-        textView.text = text
+        Prefs.defaultsDone = true
     }
 
-    private fun requestRender() {
-        val now = SystemClock.elapsedRealtime()
-        if (tab == TAB_GPS && now - lastRender < 400) return
-        lastRender = now
-        render()
-    }
-
-    // ------------------------------------------------------------------ tecles
-
-    override fun dispatchKeyEvent(event: KeyEvent): Boolean {
-        logKey("TECLA", event)
-        // Deixem que el sistema continui processant la tecla (p. ex. el volum).
-        return super.dispatchKeyEvent(event)
-    }
-
-    private fun logKey(origin: String, e: KeyEvent?) {
-        val line = if (e == null) {
-            "${now()} [$origin] (sense KeyEvent)\n"
-        } else {
-            val act = when (e.action) {
-                KeyEvent.ACTION_DOWN -> "DOWN"
-                KeyEvent.ACTION_UP -> "UP  "
-                else -> "ACT${e.action}"
-            }
-            val dev = e.device?.name ?: "?"
-            "${now()} [$origin] $act ${KeyEvent.keyCodeToString(e.keyCode)} (${e.keyCode})" +
-                " scan=${e.scanCode} rep=${e.repeatCount}" +
-                " disp=${e.deviceId}:$dev src=0x${Integer.toHexString(e.source)}\n"
+    private fun launchSlot(i: Int) {
+        val pkg = Prefs.slotPkg(i)
+        val cls = Prefs.slotCls(i)
+        if (pkg.isEmpty() || cls.isEmpty()) {
+            Toast.makeText(this, "«${Prefs.SLOT_NAMES[i]}»: tria quina app s'ha d'obrir", Toast.LENGTH_LONG).show()
+            chooseApp(i)
+            return
         }
-        keysLog.insert(0, line)
-        if (keysLog.length > MAX_LOG) keysLog.setLength(MAX_LOG)
-        runOnUiThread { if (tab == TAB_KEYS) render() }
-    }
-
-    private fun logNote(text: String) {
-        keysLog.insert(0, "${now()} [MEDIASESSION] callback: $text\n")
-        runOnUiThread { if (tab == TAB_KEYS) render() }
-    }
-
-    @Suppress("DEPRECATION")
-    private fun extractKeyEvent(i: Intent): KeyEvent? =
-        if (Build.VERSION.SDK_INT >= 33) {
-            i.getParcelableExtra(Intent.EXTRA_KEY_EVENT, KeyEvent::class.java)
-        } else {
-            i.getParcelableExtra<KeyEvent>(Intent.EXTRA_KEY_EVENT)
-        }
-
-    private fun setupMediaSession() {
-        val ms = MediaSession(this, "DiagnosiCotxe")
-        ms.setCallback(object : MediaSession.Callback() {
-            override fun onMediaButtonEvent(mediaButtonIntent: Intent): Boolean {
-                logKey("MEDIASESSION", extractKeyEvent(mediaButtonIntent))
-                return super.onMediaButtonEvent(mediaButtonIntent)
-            }
-
-            override fun onPlay() = logNote("onPlay")
-            override fun onPause() = logNote("onPause")
-            override fun onStop() = logNote("onStop")
-            override fun onSkipToNext() = logNote("onSkipToNext")
-            override fun onSkipToPrevious() = logNote("onSkipToPrevious")
-        })
-        val state = PlaybackState.Builder()
-            .setActions(
-                PlaybackState.ACTION_PLAY or
-                    PlaybackState.ACTION_PAUSE or
-                    PlaybackState.ACTION_PLAY_PAUSE or
-                    PlaybackState.ACTION_STOP or
-                    PlaybackState.ACTION_SKIP_TO_NEXT or
-                    PlaybackState.ACTION_SKIP_TO_PREVIOUS
-            )
-            .setState(PlaybackState.STATE_PLAYING, 0L, 1f)
-            .build()
-        ms.setPlaybackState(state)
-        ms.isActive = true
-        mediaSession = ms
-    }
-
-    // ------------------------------------------------------------------ GPS i bruixola
-
-    private val locListener = object : LocationListener {
-        override fun onLocationChanged(location: Location) {
-            lastLoc = location
-            requestRender()
-        }
-    }
-
-    private val gnssCallback = object : GnssStatus.Callback() {
-        override fun onSatelliteStatusChanged(status: GnssStatus) {
-            satVisible = status.satelliteCount
-            var used = 0
-            for (i in 0 until status.satelliteCount) {
-                if (status.usedInFix(i)) used++
-            }
-            satUsed = used
-            requestRender()
-        }
-    }
-
-    private val sensorListener = object : SensorEventListener {
-        override fun onSensorChanged(event: SensorEvent) {
-            val r = FloatArray(9)
-            val o = FloatArray(3)
-            SensorManager.getRotationMatrixFromVector(r, event.values)
-            SensorManager.getOrientation(r, o)
-            var deg = Math.toDegrees(o[0].toDouble()).toFloat()
-            if (deg < 0f) deg += 360f
-            azimuth = deg
-            if (tab == TAB_GPS) requestRender()
-        }
-
-        override fun onAccuracyChanged(sensor: Sensor?, accuracy: Int) {}
-    }
-
-    private fun startGps() {
-        if (gpsStarted) return
-        if (checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION) != PackageManager.PERMISSION_GRANTED) return
-        val lm = getSystemService(Context.LOCATION_SERVICE) as LocationManager
         try {
-            lm.requestLocationUpdates(LocationManager.GPS_PROVIDER, 1000L, 0f, locListener)
-            lm.registerGnssStatusCallback(mainExecutor, gnssCallback)
-            gpsStarted = true
-            gpsError = ""
-        } catch (e: SecurityException) {
-            gpsError = "Error de permisos: ${e.message}"
-        } catch (e: IllegalArgumentException) {
-            gpsError = "Sense proveidor GPS: ${e.message}"
+            val intent = Intent(Intent.ACTION_MAIN)
+                .addCategory(Intent.CATEGORY_LAUNCHER)
+                .setClassName(pkg, cls)
+                .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_RESET_TASK_IF_NEEDED)
+            startActivity(intent)
+        } catch (e: Exception) {
+            Toast.makeText(this, "No s'ha pogut obrir «${Prefs.SLOT_NAMES[i]}»: ${e.message}", Toast.LENGTH_LONG).show()
         }
     }
 
-    private fun stopGps() {
-        if (!gpsStarted) return
-        val lm = getSystemService(Context.LOCATION_SERVICE) as LocationManager
-        lm.removeUpdates(locListener)
-        lm.unregisterGnssStatusCallback(gnssCallback)
-        gpsStarted = false
-    }
-
-    private fun buildGpsText(): String {
-        val sb = StringBuilder()
-        val lm = getSystemService(Context.LOCATION_SERVICE) as LocationManager
-        val sm = getSystemService(Context.SENSOR_SERVICE) as SensorManager
-        val perm = checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED
-        val fmt = SimpleDateFormat("dd/MM/yyyy HH:mm:ss", Locale.getDefault())
-
-        sb.append("Permis d'ubicacio : ").append(if (perm) "concedit" else "NO concedit").append('\n')
-        sb.append("Proveidors        : ").append(lm.allProviders.joinToString()).append('\n')
-        sb.append("GPS activat       : ").append(lm.isProviderEnabled(LocationManager.GPS_PROVIDER)).append('\n')
-        sb.append("Satel.lits        : ").append(satUsed).append(" usats de ").append(satVisible).append(" visibles\n")
-        if (gpsError.isNotEmpty()) sb.append("ERROR             : ").append(gpsError).append('\n')
-        sb.append('\n')
-
-        val l = lastLoc
-        if (l == null) {
-            sb.append("Encara no hi ha posicio.\n")
-            sb.append("(Cal cel obert; el primer ajust pot trigar uns minuts.)\n")
-        } else {
-            val age = (SystemClock.elapsedRealtimeNanos() - l.elapsedRealtimeNanos) / 1_000_000_000L
-            sb.append(String.format(Locale.US, "Velocitat  : %.1f km/h  (te velocitat: %s)\n", l.speed * 3.6f, l.hasSpeed()))
-            sb.append(String.format(Locale.US, "Rumb (GPS) : %.0f graus  (te rumb: %s)\n", l.bearing, l.hasBearing()))
-            sb.append(String.format(Locale.US, "Alcada     : %.0f m  (te alcada: %s)\n", l.altitude, l.hasAltitude()))
-            sb.append(String.format(Locale.US, "Precisio   : %.0f m\n", l.accuracy))
-            sb.append(String.format(Locale.US, "Latitud    : %.5f\n", l.latitude))
-            sb.append(String.format(Locale.US, "Longitud   : %.5f\n", l.longitude))
-            sb.append("Hora GPS   : ").append(fmt.format(Date(l.time))).append('\n')
-            sb.append(String.format(Locale.US, "Edat dada  : %d s\n", age))
+    private fun goHome() {
+        try {
+            startActivity(
+                Intent(Intent.ACTION_MAIN)
+                    .addCategory(Intent.CATEGORY_HOME)
+                    .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            )
+        } catch (e: Exception) {
+            Toast.makeText(this, "No s'ha pogut tornar a l'inici: ${e.message}", Toast.LENGTH_LONG).show()
         }
-        sb.append("Hora sistema: ").append(fmt.format(Date())).append('\n')
-
-        sb.append("\nBRUIXOLA\n")
-        sb.append("Magnetometre     : ")
-            .append(if (sm.getDefaultSensor(Sensor.TYPE_MAGNETIC_FIELD) != null) "si" else "NO").append('\n')
-        sb.append("Sensor de rotacio: ").append(if (hasRotationSensor) "si" else "NO").append('\n')
-        val az = azimuth
-        if (hasRotationSensor && az != null) {
-            sb.append(String.format(Locale.US, "Azimut           : %.0f graus\n", az))
-        }
-        return sb.toString()
     }
-
-    // ------------------------------------------------------------------ apps i sistema
 
     @Suppress("DEPRECATION")
-    private fun buildApps(): String {
+    private fun listApps(): List<AppEntry> {
         val pm = packageManager
         val intent = Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER)
-        val found: List<ResolveInfo> = if (Build.VERSION.SDK_INT >= 33) {
-            pm.queryIntentActivities(intent, PackageManager.ResolveInfoFlags.of(0))
-        } else {
-            pm.queryIntentActivities(intent, 0)
+        val out = ArrayList<AppEntry>()
+        for (r in pm.queryIntentActivities(intent, 0)) {
+            if (r.activityInfo.packageName == packageName) continue
+            out.add(AppEntry(r.loadLabel(pm).toString(), r.activityInfo.packageName, r.activityInfo.name))
         }
-        val apps = found.sortedBy { it.loadLabel(pm).toString().lowercase() }
-        val sb = StringBuilder("APPS AMB ICONA: ${apps.size}\n\n")
-        for (r in apps) {
-            sb.append(r.loadLabel(pm)).append('\n')
-            sb.append("   ").append(r.activityInfo.packageName)
-                .append(" / ").append(r.activityInfo.name).append('\n')
-        }
-        return sb.toString()
+        out.sortBy { it.label.lowercase() }
+        return out
     }
 
-    private fun buildSystem(): String {
-        val sb = StringBuilder()
-        val dm = resources.displayMetrics
-        val landscape = resources.configuration.orientation == Configuration.ORIENTATION_LANDSCAPE
-        sb.append("Model     : ${Build.MANUFACTURER} ${Build.MODEL} (${Build.DEVICE}, ${Build.HARDWARE})\n")
-        sb.append("Android   : ${Build.VERSION.RELEASE} (API ${Build.VERSION.SDK_INT})\n")
-        sb.append("Compilacio: ${Build.DISPLAY}\n")
-        sb.append("Pantalla  : ${dm.widthPixels} x ${dm.heightPixels} px, densitat ${dm.density} (${dm.densityDpi} dpi)\n")
-        sb.append("Rotacio   : ${display?.rotation}\n")
-        sb.append("Orientacio: ${if (landscape) "apaisada" else "vertical"}\n")
-
-        val sm = getSystemService(Context.SENSOR_SERVICE) as SensorManager
-        val sensors = sm.getSensorList(Sensor.TYPE_ALL)
-        sb.append("\nSENSORS (${sensors.size})\n")
-        for (s in sensors) {
-            sb.append(" - ${s.name} [${s.stringType}]\n")
-        }
-
-        sb.append("\nDISPOSITIUS D'ENTRADA\n")
-        for (id in InputDevice.getDeviceIds()) {
-            val d = InputDevice.getDevice(id) ?: continue
-            sb.append(" - #$id ${d.name} src=0x${Integer.toHexString(d.sources)} virtual=${d.isVirtual}\n")
-        }
-        return sb.toString()
-    }
-
-    // ------------------------------------------------------------------ informe
-
-    private fun fullReport(): String =
-        "== TECLES ==\n$keysLog\n\n" +
-            "== GPS ==\n${buildGpsText()}\n\n" +
-            "== SISTEMA ==\n$sysText\n\n" +
-            "== APPS ==\n$appsText"
-
-    private fun copyReport() {
-        val cm = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
-        cm.setPrimaryClip(ClipData.newPlainText("informe", fullReport()))
-        Toast.makeText(this, "Informe copiat al porta-retalls", Toast.LENGTH_SHORT).show()
-    }
-
-    private fun shareReport() {
-        val send = Intent(Intent.ACTION_SEND)
-        send.type = "text/plain"
-        send.putExtra(Intent.EXTRA_TEXT, fullReport())
-        try {
-            startActivity(Intent.createChooser(send, "Comparteix l'informe"))
+    private fun appLabel(pkg: String, cls: String): String {
+        if (pkg.isEmpty() || cls.isEmpty()) return "Sense assignar (toca per triar)"
+        return try {
+            val pm = packageManager
+            pm.getActivityInfo(android.content.ComponentName(pkg, cls), 0).loadLabel(pm).toString()
         } catch (e: Exception) {
-            Toast.makeText(this, "No s'ha pogut compartir: ${e.message}", Toast.LENGTH_LONG).show()
+            "$pkg (no instal·lada?)"
         }
     }
 
-    private fun now(): String = SimpleDateFormat("HH:mm:ss.SSS", Locale.getDefault()).format(Date())
+    private fun chooseApp(slot: Int) {
+        val apps = listApps()
+        val labels = ArrayList<String>()
+        labels.add("(Cap: esborra l'assignació)")
+        for (a in apps) labels.add(a.label)
+        val lv = ListView(this)
+        lv.adapter = object : ArrayAdapter<String>(this, android.R.layout.simple_list_item_1, labels) {
+            override fun getView(position: Int, convertView: View?, parent: ViewGroup): View {
+                val v = super.getView(position, convertView, parent) as TextView
+                v.setTextSize(TypedValue.COMPLEX_UNIT_SP, 26f)
+                v.setPadding(dp(16f), dp(14f), dp(16f), dp(14f))
+                return v
+            }
+        }
+        val dlg = AlertDialog.Builder(this)
+            .setTitle("App per a «${Prefs.SLOT_NAMES[slot]}»")
+            .setView(lv)
+            .setNegativeButton("Cancel·la", null)
+            .create()
+        lv.setOnItemClickListener { _, _, pos, _ ->
+            if (pos == 0) {
+                Prefs.setSlot(slot, "", "")
+            } else {
+                val a = apps[pos - 1]
+                Prefs.setSlot(slot, a.pkg, a.cls)
+            }
+            dlg.dismiss()
+            refreshSettings()
+        }
+        dlg.show()
+    }
+
+    // ------------------------------------------------------------------ viatge i nivell
+
+    private fun confirmResetTrip() {
+        val dlg = AlertDialog.Builder(this)
+            .setTitle("Posar el viatge a zero?")
+            .setMessage("S'esborren la distància, els temps i la velocitat màxima.")
+            .setPositiveButton("Posa a zero") { _, _ -> GpsHub.resetTrip() }
+            .setNegativeButton("Cancel·la", null)
+            .create()
+        dlg.show()
+        dlg.findViewById<TextView>(android.R.id.message)?.setTextSize(TypedValue.COMPLEX_UNIT_SP, 24f)
+        dlg.getButton(AlertDialog.BUTTON_POSITIVE)?.setTextSize(TypedValue.COMPLEX_UNIT_SP, 22f)
+        dlg.getButton(AlertDialog.BUTTON_NEGATIVE)?.setTextSize(TypedValue.COMPLEX_UNIT_SP, 22f)
+    }
+
+    private fun calibrateLevel() {
+        val ok = AccelHub.calibrate()
+        val msg = if (ok) "Nivell calibrat" else "L'acceleròmetre encara no ha donat dades"
+        Toast.makeText(this, msg, Toast.LENGTH_SHORT).show()
+    }
+
+    // ------------------------------------------------------------------ pàgina d'ajustaments
+
+    private fun label(text: String, sp: Float, color: Int): TextView {
+        val t = TextView(this)
+        t.text = text
+        t.setTextSize(TypedValue.COMPLEX_UNIT_SP, sp)
+        t.setTextColor(color)
+        return t
+    }
+
+    private fun header(col: LinearLayout, text: String) {
+        val t = label(text, 30f, Pal.AMBER)
+        t.typeface = Typeface.DEFAULT_BOLD
+        t.setPadding(0, dp(22f), 0, dp(6f))
+        col.addView(t)
+    }
+
+    private fun hint(col: LinearLayout, text: String) {
+        val t = label(text, 20f, Pal.GRAY)
+        t.setPadding(0, dp(4f), 0, dp(4f))
+        col.addView(t)
+    }
+
+    private fun bigButton(text: String, onClick: () -> Unit): Button {
+        val b = makeButton(text, 24f, Pal.BUTTON, Pal.BUTTON_PRESSED, Color.WHITE)
+        b.setOnClickListener { onClick() }
+        return b
+    }
+
+    private fun addButton(col: LinearLayout, b: Button) {
+        val lp = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(64f))
+        lp.setMargins(0, dp(4f), 0, dp(4f))
+        col.addView(b, lp)
+    }
+
+    private fun buildSettings(): ScrollView {
+        val sv = ScrollView(this)
+        val col = LinearLayout(this)
+        col.orientation = LinearLayout.VERTICAL
+        col.setPadding(dp(24f), dp(8f), dp(24f), dp(32f))
+        sv.addView(col, ViewGroup.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
+
+        // --- Alçada
+        header(col, "Correcció de l'alçada")
+        altInfo = label("", 26f, Color.WHITE)
+        col.addView(altInfo)
+        val altRow = LinearLayout(this)
+        altRow.orientation = LinearLayout.HORIZONTAL
+        for (d in intArrayOf(-50, -10, -1, 1, 10, 50)) {
+            val b = bigButton(if (d > 0) "+$d" else "$d") {
+                Prefs.altOffset = Prefs.altOffset + d
+                refreshSettings()
+            }
+            val lp = LinearLayout.LayoutParams(0, dp(64f), 1f)
+            lp.setMargins(dp(3f), dp(4f), dp(3f), dp(4f))
+            altRow.addView(b, lp)
+        }
+        col.addView(altRow)
+        addButton(col, bigButton("Treu la correcció (0 m)") {
+            Prefs.altOffset = 0.0
+            refreshSettings()
+        })
+        hint(col, "Compara amb l'alçada real d'on ets (un mapa, un rètol) i ajusta fins que coincideixi. Es desa sola.")
+
+        // --- Botons d'apps
+        header(col, "Botons d'apps")
+        for (i in 0 until Prefs.SLOTS) {
+            val row = LinearLayout(this)
+            row.orientation = LinearLayout.HORIZONTAL
+            row.gravity = Gravity.CENTER_VERTICAL
+            val name = label(Prefs.SLOT_NAMES[i], 26f, Color.WHITE)
+            name.typeface = Typeface.DEFAULT_BOLD
+            row.addView(name, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+            val b = bigButton("") { chooseApp(i) }
+            b.setTextSize(TypedValue.COMPLEX_UNIT_SP, 22f)
+            slotRowButtons.add(b)
+            val lp = LinearLayout.LayoutParams(0, dp(64f), 2f)
+            lp.setMargins(0, dp(4f), 0, dp(4f))
+            row.addView(b, lp)
+            col.addView(row)
+        }
+        hint(col, "També pots mantenir premut un botó de la barra de baix per canviar-ne l'app.")
+
+        // --- Acceleròmetre
+        header(col, "Acceleròmetre")
+        addButton(col, bigButton("Calibra el nivell ara (cotxe aturat i en pla)") { calibrateLevel() })
+        swapBtn = bigButton("") {
+            Prefs.accSwap = !Prefs.accSwap
+            AccelHub.loadSettings()
+            refreshSettings()
+        }
+        addButton(col, swapBtn)
+        invFwdBtn = bigButton("") {
+            Prefs.accInvFwd = !Prefs.accInvFwd
+            AccelHub.loadSettings()
+            refreshSettings()
+        }
+        addButton(col, invFwdBtn)
+        invLatBtn = bigButton("") {
+            Prefs.accInvLat = !Prefs.accInvLat
+            AccelHub.loadSettings()
+            refreshSettings()
+        }
+        addButton(col, invLatBtn)
+        hint(col, "Si en accelerar la bola va cap avall, o en girar cap a la dreta va cap a l'esquerra, canvia aquests ajustaments. Després torna a calibrar.")
+
+        // --- Viatge
+        header(col, "Viatge")
+        addButton(col, bigButton("Posa el viatge a zero") { confirmResetTrip() })
+
+        // --- GPS
+        header(col, "GPS")
+        gpsInfo = label("", 24f, Color.WHITE)
+        col.addView(gpsInfo)
+        addButton(col, bigButton("Demana el permís d'ubicació") { ensureGps() })
+        addButton(col, bigButton("Atura el GPS i tanca l'app") {
+            GpsHub.persist()
+            stopService(Intent(this, GpsService::class.java))
+            finishAndRemoveTask()
+        })
+
+        // --- Diagnosi
+        header(col, "Diagnosi")
+        addButton(col, bigButton("Obre la diagnosi de tecles, GPS i sistema") {
+            startActivity(Intent(this, DiagActivity::class.java))
+        })
+        hint(col, "Per veure quines tecles del volant arriben a l'app. Per tornar, fes servir el botó de tornar de la unitat.")
+
+        val ver = label("Tauler cotxe 0.2", 18f, Pal.GRAY)
+        ver.setPadding(0, dp(24f), 0, 0)
+        col.addView(ver)
+        return sv
+    }
+
+    private fun onOff(v: Boolean) = if (v) "sí" else "no"
+
+    private fun refreshSettings() {
+        val raw = GpsHub.altitudeRaw
+        val off = Prefs.altOffset
+        altInfo.text = if (raw.isNaN()) {
+            "Correcció: " + Fmt.signed(off, 0) + " m   (encara no hi ha alçada del GPS)"
+        } else {
+            "GPS brut: " + Fmt.num(raw, 0) + " m   Correcció: " + Fmt.signed(off, 0) +
+                " m   Es mostra: " + Fmt.num(raw + off, 0) + " m"
+        }
+        for (i in slotRowButtons.indices) {
+            slotRowButtons[i].text = appLabel(Prefs.slotPkg(i), Prefs.slotCls(i))
+        }
+        swapBtn.text = "Eixos intercanviats: " + onOff(Prefs.accSwap)
+        invFwdBtn.text = "Inverteix accelera/frena: " + onOff(Prefs.accInvFwd)
+        invLatBtn.text = "Inverteix esquerra/dreta: " + onOff(Prefs.accInvLat)
+        gpsInfo.text = GpsHub.statusLabel() + " — satèl·lits " + GpsHub.satsUsed + "/" + GpsHub.satsVisible +
+            "   Servei: " + (if (GpsHub.serviceRunning) "actiu" else "aturat")
+    }
+
+    private companion object {
+        const val REQ_LOCATION = 1
+        const val TAB_SETTINGS = 3
+    }
 }

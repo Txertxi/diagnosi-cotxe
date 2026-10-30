@@ -8,11 +8,22 @@ android {
     compileSdk = 34
 
     defaultConfig {
-        applicationId = "cat.sergibonet.diagnosi"
+        applicationId = "cat.sergibonet.tauler"
         minSdk = 30
         targetSdk = 33
-        versionCode = 1
-        versionName = "0.1"
+        versionCode = 2
+        versionName = "0.2"
+    }
+
+    // Clau fixa (inclosa al projecte) perquè cada versió nova es pugui instal·lar
+    // damunt de l'anterior sense desinstal·lar res. No és secreta: és de proves.
+    signingConfigs {
+        getByName("debug") {
+            storeFile = file("debug.keystore")
+            storePassword = "android"
+            keyAlias = "androiddebugkey"
+            keyPassword = "android"
+        }
     }
 
     buildTypes {
