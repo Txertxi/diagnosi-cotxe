@@ -137,11 +137,11 @@ class CompassPainter {
     }
     private val tick = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         color = Pal.GRAY
-        strokeWidth = 3f
+        strokeWidth = 2.5f
     }
     private val tickBig = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         color = Pal.WHITE
-        strokeWidth = 5f
+        strokeWidth = 4f
     }
     private val marker = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = Pal.AMBER }
     private val arrow = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = Pal.WHITE }
@@ -152,6 +152,7 @@ class CompassPainter {
     private val names = arrayOf("N", "NE", "E", "SE", "S", "SO", "O", "NO")
 
     fun draw(c: Canvas, cx: Float, cy: Float, r: Float, headingDeg: Float, alpha: Int) {
+        val s = r / 112f
         tick.alpha = alpha
         tickBig.alpha = alpha
         arrow.alpha = alpha
@@ -164,7 +165,7 @@ class CompassPainter {
             val big = i % 3 == 0
             c.save()
             c.rotate(i * 10f, cx, cy)
-            c.drawLine(cx, cy - r + 6f, cx, cy - r + (if (big) 30f else 18f), if (big) tickBig else tick)
+            c.drawLine(cx, cy - r + 5f * s, cx, cy - r + (if (big) 24f else 14f) * s, if (big) tickBig else tick)
             c.restore()
         }
         for (i in 0 until 8) {
@@ -173,8 +174,8 @@ class CompassPainter {
             c.rotate(i * 45f, cx, cy)
             val painter = if (i == 0) north else if (isCardinal) cardinal else inter
             painter.draw(
-                c, names[i], cx, cy - r + (if (isCardinal) 80f else 70f),
-                if (isCardinal) 52f else 30f, Paint.Align.CENTER, 0f, alpha
+                c, names[i], cx, cy - r + (if (isCardinal) 58f else 50f) * s,
+                (if (isCardinal) 30f else 18f) * s, Paint.Align.CENTER, 0f, alpha
             )
             c.restore()
         }
@@ -182,20 +183,105 @@ class CompassPainter {
 
         // Marcador fix a dalt: indica la direcció de la marxa.
         path.reset()
-        path.moveTo(cx - 15f, cy - r - 6f)
-        path.lineTo(cx + 15f, cy - r - 6f)
-        path.lineTo(cx, cy - r + 24f)
+        path.moveTo(cx - 13f * s, cy - r - 5f * s)
+        path.lineTo(cx + 13f * s, cy - r - 5f * s)
+        path.lineTo(cx, cy - r + 20f * s)
         path.close()
         c.drawPath(path, marker)
 
         // Fletxa central fixa.
         path.reset()
-        path.moveTo(cx, cy - 30f)
-        path.lineTo(cx + 18f, cy + 24f)
-        path.lineTo(cx, cy + 10f)
-        path.lineTo(cx - 18f, cy + 24f)
+        path.moveTo(cx, cy - 26f * s)
+        path.lineTo(cx + 15f * s, cy + 20f * s)
+        path.lineTo(cx, cy + 8f * s)
+        path.lineTo(cx - 15f * s, cy + 20f * s)
         path.close()
         c.drawPath(path, arrow)
+    }
+}
+
+/**
+ * Altímetre d'aviació: una sola escala 0-9. L'agulla llarga i prima (blanca) marca els
+ * centenars (una volta = 1.000 m) i la curta (taronja) els milers (una volta = 10.000 m).
+ */
+class AltimeterPainter {
+    private val face = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = Pal.PANEL }
+    private val ring = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        style = Paint.Style.STROKE
+        strokeWidth = 6f
+        color = Pal.RING
+    }
+    private val minor = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = Pal.GRAY
+        strokeWidth = 1.5f
+    }
+    private val major = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = Pal.WHITE
+        strokeWidth = 3f
+    }
+    private val num = Txt(Pal.WHITE)
+    private val label = Txt(Pal.GRAY, false)
+    private val thousands = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = Pal.AMBER }
+    private val hundreds = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = Pal.WHITE
+        strokeCap = Paint.Cap.ROUND
+    }
+    private val hub = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = Pal.WHITE }
+    private val path = Path()
+
+    fun draw(c: Canvas, cx: Float, cy: Float, r: Float, altM: Double) {
+        val s = r / 112f
+        c.drawCircle(cx, cy, r, face)
+        c.drawCircle(cx, cy, r, ring)
+
+        // Escala estreta: 50 marques fines, una de més llarga cada 5.
+        for (i in 0 until 50) {
+            val big = i % 5 == 0
+            c.save()
+            c.rotate(i * 7.2f, cx, cy)
+            c.drawLine(cx, cy - r + 6f * s, cx, cy - r + (if (big) 18f else 11f) * s, if (big) major else minor)
+            c.restore()
+        }
+
+        // Xifres 0-9 sempre dretes, més petites que a la brúixola.
+        val rr = r - 36f * s
+        val size = 21f * s
+        for (k in 0 until 10) {
+            val a = Math.toRadians(k * 36.0)
+            val x = cx + (rr * Math.sin(a)).toFloat()
+            val y = cy - (rr * Math.cos(a)).toFloat() + size * 0.35f
+            num.draw(c, k.toString(), x, y, size, Paint.Align.CENTER)
+        }
+        label.draw(c, "ALTÍMETRE", cx, cy + 38f * s, 14f * s, Paint.Align.CENTER)
+
+        if (!altM.isNaN()) {
+            val a = if (altM < 0.0) 0.0 else altM
+            val angThousands = ((a % 10000.0) / 10000.0 * 360.0).toFloat()
+            val angHundreds = ((a % 1000.0) / 1000.0 * 360.0).toFloat()
+
+            // Agulla curta i gruixuda (milers), amb punta de fletxa.
+            c.save()
+            c.rotate(angThousands, cx, cy)
+            path.reset()
+            path.moveTo(cx - 6f * s, cy + 10f * s)
+            path.lineTo(cx - 6f * s, cy - 36f * s)
+            path.lineTo(cx - 13f * s, cy - 36f * s)
+            path.lineTo(cx, cy - 60f * s)
+            path.lineTo(cx + 13f * s, cy - 36f * s)
+            path.lineTo(cx + 6f * s, cy - 36f * s)
+            path.lineTo(cx + 6f * s, cy + 10f * s)
+            path.close()
+            c.drawPath(path, thousands)
+            c.restore()
+
+            // Agulla llarga i prima (centenars).
+            c.save()
+            c.rotate(angHundreds, cx, cy)
+            hundreds.strokeWidth = 4.5f * s
+            c.drawLine(cx, cy + 20f * s, cx, cy - r + 14f * s, hundreds)
+            c.restore()
+        }
+        c.drawCircle(cx, cy, 8f * s, hub)
     }
 }
 

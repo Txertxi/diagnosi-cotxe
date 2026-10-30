@@ -2,6 +2,7 @@ package cat.sergibonet.diagnosi
 
 import android.location.Location
 import android.os.SystemClock
+import java.util.TimeZone
 
 /**
  * Estat compartit del GPS. El servei l'actualitza i les pantalles el llegeixen.
@@ -64,6 +65,9 @@ object GpsHub {
 
         trip.onFix(l.elapsedRealtimeNanos / 1_000_000L, speedKmh, if (accuracy.isNaN()) 0.0 else accuracy)
 
+        // Avís sonor de velocitat (si està activat als ajustaments).
+        SpeedAlert.onFix(lastFixElapsedMs, speedKmh)
+
         // Hora GPS: es guarda la diferència amb el rellotge del sistema.
         val off = l.time - System.currentTimeMillis()
         if (!haveClock) {
@@ -105,38 +109,25 @@ object GpsHub {
     fun statusColor(): Int = when {
         !permissionOk -> Pal.RED
         hasFreshFix() -> Pal.GREEN
-        lastFixElapsedMs == 0L -> Pal.AMBER
         else -> Pal.AMBER
     }
 }
 
-/** Acceleròmetre compartit entre l'activitat (que rep les dades) i la pantalla de sensors. */
-object AccelHub {
-    val calc = AccelCalc()
-    var available = false
-    private var lastTs = 0L
+/** Hores de sortida i posta del sol, recalculades un cop per minut. */
+object SunCache {
+    var rise = "--:--"
+        private set
+    var set = "--:--"
+        private set
+    private var key = -1L
 
-    fun loadSettings() {
-        calc.swap = Prefs.accSwap
-        calc.invFwd = Prefs.accInvFwd
-        calc.invLat = Prefs.accInvLat
-        val r = Prefs.accRef()
-        if (r != null) calc.setRef(r[0], r[1], r[2])
-    }
-
-    fun onValues(x: Double, y: Double, z: Double, tsNs: Long) {
-        val dt = if (lastTs == 0L) 0.06 else (tsNs - lastTs) / 1e9
-        lastTs = tsNs
-        calc.feed(x, y, z, dt.coerceIn(0.005, 0.5))
-    }
-
-    fun calibrate(): Boolean {
-        val ok = calc.calibrate()
-        if (ok) Prefs.setAccRef(calc.refVec())
-        return ok
-    }
-
-    fun resetClock() {
-        lastTs = 0L
+    fun refresh(nowMs: Long, tz: TimeZone, lat: Double, lon: Double) {
+        val hasPos = !lat.isNaN() && !lon.isNaN()
+        val k = (nowMs / 60000L) * 2L + (if (hasPos) 1L else 0L)
+        if (k == key) return
+        key = k
+        val r = SunTimes.compute(lat, lon, SunTimes.localNoon(nowMs, tz))
+        rise = if (r != null) Fmt.hm(r[0], tz) else "--:--"
+        set = if (r != null) Fmt.hm(r[1], tz) else "--:--"
     }
 }

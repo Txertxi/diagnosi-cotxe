@@ -108,6 +108,7 @@ class GpsService : Service() {
             registered = false
         }
         GpsHub.serviceRunning = false
+        SpeedAlert.release()
         GpsHub.persist()
         super.onDestroy()
     }

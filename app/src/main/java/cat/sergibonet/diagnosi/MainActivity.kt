@@ -3,18 +3,16 @@ package cat.sergibonet.diagnosi
 import android.Manifest
 import android.app.Activity
 import android.app.AlertDialog
-import android.content.Context
+import android.content.ComponentName
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.graphics.Color
 import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
 import android.graphics.drawable.StateListDrawable
-import android.hardware.Sensor
-import android.hardware.SensorEvent
-import android.hardware.SensorEventListener
-import android.hardware.SensorManager
+import android.net.Uri
 import android.os.Bundle
+import android.provider.Settings
 import android.util.TypedValue
 import android.view.Gravity
 import android.view.View
@@ -30,29 +28,27 @@ import android.widget.TextView
 import android.widget.Toast
 
 /**
- * Tauler del cotxe: quatre pàgines (Conducció, Viatge, Sensors, Ajustaments)
+ * Tauler del cotxe: tres pàgines (Conducció, Viatge, Ajustaments)
  * i una barra inferior amb botons grans per obrir altres apps.
  */
-class MainActivity : Activity(), SensorEventListener {
+class MainActivity : Activity() {
 
     private class AppEntry(val label: String, val pkg: String, val cls: String)
 
-    private val tabNames = arrayOf("Conducció", "Viatge", "Sensors", "Ajustaments")
+    private val tabNames = arrayOf("Conducció", "Viatge", "Ajustaments")
     private val tabButtons = ArrayList<Button>()
-    private val slotButtons = ArrayList<Button>()
     private lateinit var pages: Array<View>
-    private lateinit var settingsRoot: ScrollView
     private var current = 0
 
     // Peces de la pantalla d'ajustaments que s'han d'actualitzar.
     private lateinit var altInfo: TextView
     private lateinit var gpsInfo: TextView
-    private lateinit var swapBtn: Button
-    private lateinit var invFwdBtn: Button
-    private lateinit var invLatBtn: Button
+    private lateinit var alertInfo: TextView
+    private lateinit var alertBtn: Button
+    private lateinit var delayInfo: TextView
+    private lateinit var overlayInfo: TextView
+    private lateinit var returnInfo: TextView
     private val slotRowButtons = ArrayList<Button>()
-
-    private var sensorManager: SensorManager? = null
 
     // ------------------------------------------------------------------ cicle de vida
 
@@ -61,7 +57,6 @@ class MainActivity : Activity(), SensorEventListener {
         Prefs.init(this)
         GpsHub.restore()
         applyDefaults()
-        AccelHub.loadSettings()
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         setContentView(buildUi())
         selectTab(0)
@@ -70,20 +65,15 @@ class MainActivity : Activity(), SensorEventListener {
 
     override fun onResume() {
         super.onResume()
+        UiState.visible = true
         GpsHub.permissionOk = hasLocationPermission()
         if (GpsHub.permissionOk && !GpsHub.serviceRunning) startGpsService()
-        val sm = getSystemService(Context.SENSOR_SERVICE) as SensorManager
-        sensorManager = sm
-        val acc = sm.getDefaultSensor(Sensor.TYPE_ACCELEROMETER)
-        AccelHub.available = acc != null
-        AccelHub.resetClock()
-        if (acc != null) sm.registerListener(this, acc, SensorManager.SENSOR_DELAY_UI)
         if (current == TAB_SETTINGS) refreshSettings()
     }
 
     override fun onPause() {
         super.onPause()
-        sensorManager?.unregisterListener(this)
+        UiState.visible = false
         GpsHub.persist()
     }
 
@@ -95,17 +85,6 @@ class MainActivity : Activity(), SensorEventListener {
         if (GpsHub.permissionOk) startGpsService()
         if (current == TAB_SETTINGS) refreshSettings()
     }
-
-    override fun onSensorChanged(event: SensorEvent) {
-        if (event.sensor.type == Sensor.TYPE_ACCELEROMETER) {
-            AccelHub.onValues(
-                event.values[0].toDouble(), event.values[1].toDouble(),
-                event.values[2].toDouble(), event.timestamp
-            )
-        }
-    }
-
-    override fun onAccuracyChanged(sensor: Sensor?, accuracy: Int) {}
 
     // ------------------------------------------------------------------ GPS i permisos
 
@@ -190,10 +169,7 @@ class MainActivity : Activity(), SensorEventListener {
         val drive = DrivePage(this)
         val trip = TripPage(this)
         trip.onReset = { confirmResetTrip() }
-        val sensors = SensorsPage(this)
-        sensors.onCalibrate = { calibrateLevel() }
-        settingsRoot = buildSettings()
-        pages = arrayOf(drive, trip, sensors, settingsRoot)
+        pages = arrayOf(drive, trip, buildSettings())
 
         val content = FrameLayout(this)
         for (p in pages) {
@@ -206,13 +182,12 @@ class MainActivity : Activity(), SensorEventListener {
         bar.orientation = LinearLayout.HORIZONTAL
         for (i in 0 until Prefs.SLOTS) {
             val b = makeButton(Prefs.SLOT_NAMES[i], 24f, Pal.BUTTON, Pal.BUTTON_PRESSED, Color.WHITE)
-            b.setOnClickListener { launchSlot(i) }
+            b.setOnClickListener { onSlotTap(i) }
             b.setOnLongClickListener {
-                chooseApp(i)
+                onSlotLong(i)
                 true
             }
             bar.addView(b, weightParams())
-            slotButtons.add(b)
         }
         val home = makeButton("Inici", 24f, 0xFF1D4E89.toInt(), 0xFF2F6DB8.toInt(), Color.WHITE)
         home.setOnClickListener { goHome() }
@@ -251,20 +226,35 @@ class MainActivity : Activity(), SensorEventListener {
         Prefs.defaultsDone = true
     }
 
-    private fun launchSlot(i: Int) {
-        val pkg = Prefs.slotPkg(i)
-        val cls = Prefs.slotCls(i)
-        if (pkg.isEmpty() || cls.isEmpty()) {
+    private fun isUnassigned(i: Int): Boolean = Prefs.slotPkg(i).isEmpty() || Prefs.slotCls(i).isEmpty()
+
+    /** Toc curt: a Ràdio i músiques obre l'app i torna al tauler; als altres, obre l'app i s'hi queda. */
+    private fun onSlotTap(i: Int) {
+        if (isUnassigned(i)) {
             Toast.makeText(this, "«${Prefs.SLOT_NAMES[i]}»: tria quina app s'ha d'obrir", Toast.LENGTH_LONG).show()
             chooseApp(i)
             return
         }
+        launchSlot(i, i in Prefs.RETURN_SLOTS)
+    }
+
+    /** Toc llarg: a Ràdio i músiques obre l'app i s'hi queda; als altres, canvia l'app assignada. */
+    private fun onSlotLong(i: Int) {
+        if (i in Prefs.RETURN_SLOTS && !isUnassigned(i)) {
+            launchSlot(i, false)
+        } else {
+            chooseApp(i)
+        }
+    }
+
+    private fun launchSlot(i: Int, backToDashboard: Boolean) {
         try {
             val intent = Intent(Intent.ACTION_MAIN)
                 .addCategory(Intent.CATEGORY_LAUNCHER)
-                .setClassName(pkg, cls)
+                .setClassName(Prefs.slotPkg(i), Prefs.slotCls(i))
                 .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_RESET_TASK_IF_NEEDED)
             startActivity(intent)
+            if (backToDashboard) Returner.scheduleReturn(this, Prefs.returnDelayMs)
         } catch (e: Exception) {
             Toast.makeText(this, "No s'ha pogut obrir «${Prefs.SLOT_NAMES[i]}»: ${e.message}", Toast.LENGTH_LONG).show()
         }
@@ -299,7 +289,7 @@ class MainActivity : Activity(), SensorEventListener {
         if (pkg.isEmpty() || cls.isEmpty()) return "Sense assignar (toca per triar)"
         return try {
             val pm = packageManager
-            pm.getActivityInfo(android.content.ComponentName(pkg, cls), 0).loadLabel(pm).toString()
+            pm.getActivityInfo(ComponentName(pkg, cls), 0).loadLabel(pm).toString()
         } catch (e: Exception) {
             "$pkg (no instal·lada?)"
         }
@@ -337,7 +327,7 @@ class MainActivity : Activity(), SensorEventListener {
         dlg.show()
     }
 
-    // ------------------------------------------------------------------ viatge i nivell
+    // ------------------------------------------------------------------ viatge
 
     private fun confirmResetTrip() {
         val dlg = AlertDialog.Builder(this)
@@ -352,10 +342,80 @@ class MainActivity : Activity(), SensorEventListener {
         dlg.getButton(AlertDialog.BUTTON_NEGATIVE)?.setTextSize(TypedValue.COMPLEX_UNIT_SP, 22f)
     }
 
-    private fun calibrateLevel() {
-        val ok = AccelHub.calibrate()
-        val msg = if (ok) "Nivell calibrat" else "L'acceleròmetre encara no ha donat dades"
-        Toast.makeText(this, msg, Toast.LENGTH_SHORT).show()
+    // ------------------------------------------------------------------ teclat numèric propi
+
+    /** Teclat gran per escriure un número enter (sense dependre del teclat del sistema). */
+    private fun askNumber(title: String, unit: String, allowNegative: Boolean, onOk: (Int) -> Unit) {
+        val sb = StringBuilder()
+        val col = LinearLayout(this)
+        col.orientation = LinearLayout.VERTICAL
+        col.setPadding(dp(16f), dp(8f), dp(16f), dp(8f))
+
+        val display = label("0 $unit", 40f, Color.WHITE)
+        display.gravity = Gravity.CENTER
+        display.typeface = Typeface.DEFAULT_BOLD
+        display.setPadding(0, dp(8f), 0, dp(12f))
+        col.addView(display)
+
+        fun refresh() {
+            display.text = (if (sb.isEmpty()) "0" else sb.toString()) + " " + unit
+        }
+
+        fun key(text: String, action: () -> Unit): Button {
+            val b = makeButton(text, 30f, Pal.BUTTON, Pal.BUTTON_PRESSED, Color.WHITE)
+            b.setOnClickListener {
+                action()
+                refresh()
+            }
+            return b
+        }
+
+        val rows = arrayOf(
+            arrayOf("7", "8", "9"),
+            arrayOf("4", "5", "6"),
+            arrayOf("1", "2", "3"),
+            arrayOf("±", "0", "⌫")
+        )
+        for (r in rows) {
+            val line = LinearLayout(this)
+            line.orientation = LinearLayout.HORIZONTAL
+            for (k in r) {
+                val b = key(k) {
+                    when (k) {
+                        "⌫" -> {
+                            if (sb.isNotEmpty()) sb.deleteCharAt(sb.length - 1)
+                            if (sb.toString() == "-") sb.setLength(0)
+                        }
+                        "±" -> {
+                            if (allowNegative) {
+                                if (sb.startsWith("-")) sb.deleteCharAt(0) else sb.insert(0, "-")
+                            }
+                        }
+                        else -> {
+                            val digits = sb.count { it.isDigit() }
+                            if (digits < 5) sb.append(k)
+                        }
+                    }
+                }
+                val lp = LinearLayout.LayoutParams(0, dp(64f), 1f)
+                lp.setMargins(dp(4f), dp(4f), dp(4f), dp(4f))
+                line.addView(b, lp)
+            }
+            col.addView(line)
+        }
+
+        val dlg = AlertDialog.Builder(this)
+            .setTitle(title)
+            .setView(col)
+            .setPositiveButton("D'acord") { _, _ ->
+                onOk(sb.toString().toIntOrNull() ?: 0)
+                refreshSettings()
+            }
+            .setNegativeButton("Cancel·la", null)
+            .create()
+        dlg.show()
+        dlg.getButton(AlertDialog.BUTTON_POSITIVE)?.setTextSize(TypedValue.COMPLEX_UNIT_SP, 24f)
+        dlg.getButton(AlertDialog.BUTTON_NEGATIVE)?.setTextSize(TypedValue.COMPLEX_UNIT_SP, 24f)
     }
 
     // ------------------------------------------------------------------ pàgina d'ajustaments
@@ -393,6 +453,18 @@ class MainActivity : Activity(), SensorEventListener {
         col.addView(b, lp)
     }
 
+    /** Fila de botons petits (p. ex. «−1» i «+1»), repartits a parts iguals. */
+    private fun addButtonRow(col: LinearLayout, vararg buttons: Button) {
+        val row = LinearLayout(this)
+        row.orientation = LinearLayout.HORIZONTAL
+        for (b in buttons) {
+            val lp = LinearLayout.LayoutParams(0, dp(64f), 1f)
+            lp.setMargins(dp(3f), dp(4f), dp(3f), dp(4f))
+            row.addView(b, lp)
+        }
+        col.addView(row)
+    }
+
     private fun buildSettings(): ScrollView {
         val sv = ScrollView(this)
         val col = LinearLayout(this)
@@ -400,27 +472,52 @@ class MainActivity : Activity(), SensorEventListener {
         col.setPadding(dp(24f), dp(8f), dp(24f), dp(32f))
         sv.addView(col, ViewGroup.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
 
-        // --- Alçada
-        header(col, "Correcció de l'alçada")
+        // --- Altímetre
+        header(col, "Correcció de l'altímetre")
         altInfo = label("", 26f, Color.WHITE)
         col.addView(altInfo)
-        val altRow = LinearLayout(this)
-        altRow.orientation = LinearLayout.HORIZONTAL
-        for (d in intArrayOf(-50, -10, -1, 1, 10, 50)) {
-            val b = bigButton(if (d > 0) "+$d" else "$d") {
-                Prefs.altOffset = Prefs.altOffset + d
+        addButtonRow(
+            col,
+            bigButton("−1 m") {
+                Prefs.altOffset = Prefs.altOffset - 1
+                refreshSettings()
+            },
+            bigButton("+1 m") {
+                Prefs.altOffset = Prefs.altOffset + 1
                 refreshSettings()
             }
-            val lp = LinearLayout.LayoutParams(0, dp(64f), 1f)
-            lp.setMargins(dp(3f), dp(4f), dp(3f), dp(4f))
-            altRow.addView(b, lp)
-        }
-        col.addView(altRow)
+        )
+        addButton(col, bigButton("Escriu la correcció (p. ex. −48 m)") {
+            askNumber("Correcció de l'alçada", "m", true) { Prefs.altOffset = it.toDouble() }
+        })
+        addButton(col, bigButton("Escriu l'alçada real d'on ets") {
+            val raw = GpsHub.altitudeRaw
+            if (raw.isNaN()) {
+                Toast.makeText(this, "Encara no hi ha alçada del GPS", Toast.LENGTH_LONG).show()
+            } else {
+                askNumber("Alçada real d'aquí", "m", true) { Prefs.altOffset = it - raw }
+            }
+        })
         addButton(col, bigButton("Treu la correcció (0 m)") {
             Prefs.altOffset = 0.0
             refreshSettings()
         })
-        hint(col, "Compara amb l'alçada real d'on ets (un mapa, un rètol) i ajusta fins que coincideixi. Es desa sola.")
+        hint(col, "L'alçada del GPS és aproximada. Pots escriure directament la correcció o dir l'alçada real d'on ets i l'app calcula la correcció. Es desa sola.")
+
+        // --- Avís de velocitat
+        header(col, "Avís de velocitat")
+        alertInfo = label("", 26f, Color.WHITE)
+        col.addView(alertInfo)
+        alertBtn = bigButton("") {
+            Prefs.alertOn = !Prefs.alertOn
+            refreshSettings()
+        }
+        addButton(col, alertBtn)
+        addButton(col, bigButton("Canvia el llindar (km/h)") {
+            askNumber("Llindar de l'avís", "km/h", false) { Prefs.alertKmh = it.toDouble() }
+        })
+        addButton(col, bigButton("Prova el so") { SpeedAlert.play() })
+        hint(col, "Quan la velocitat del GPS arriba al llindar, sona «pi-pi-pi-pi» i es repeteix cada 10 segons mentre s'hi mantingui. Sona pel volum de multimèdia i no atura la ràdio.")
 
         // --- Botons d'apps
         header(col, "Botons d'apps")
@@ -439,30 +536,26 @@ class MainActivity : Activity(), SensorEventListener {
             row.addView(b, lp)
             col.addView(row)
         }
-        hint(col, "També pots mantenir premut un botó de la barra de baix per canviar-ne l'app.")
+        hint(col, "Ràdio, Música local i Música mòbil: toc curt = obre l'app i torna al tauler (l'àudio continua); toc llarg = obre l'app i s'hi queda. Als altres botons, el toc llarg canvia l'app assignada.")
 
-        // --- Acceleròmetre
-        header(col, "Acceleròmetre")
-        addButton(col, bigButton("Calibra el nivell ara (cotxe aturat i en pla)") { calibrateLevel() })
-        swapBtn = bigButton("") {
-            Prefs.accSwap = !Prefs.accSwap
-            AccelHub.loadSettings()
-            refreshSettings()
-        }
-        addButton(col, swapBtn)
-        invFwdBtn = bigButton("") {
-            Prefs.accInvFwd = !Prefs.accInvFwd
-            AccelHub.loadSettings()
-            refreshSettings()
-        }
-        addButton(col, invFwdBtn)
-        invLatBtn = bigButton("") {
-            Prefs.accInvLat = !Prefs.accInvLat
-            AccelHub.loadSettings()
-            refreshSettings()
-        }
-        addButton(col, invLatBtn)
-        hint(col, "Si en accelerar la bola va cap avall, o en girar cap a la dreta va cap a l'esquerra, canvia aquests ajustaments. Després torna a calibrar.")
+        // --- Retorn al tauler
+        header(col, "Retorn al tauler")
+        delayInfo = label("", 26f, Color.WHITE)
+        col.addView(delayInfo)
+        addButtonRow(
+            col,
+            bigButton("−500") { changeDelay(-500L) },
+            bigButton("−100") { changeDelay(-100L) },
+            bigButton("+100") { changeDelay(100L) },
+            bigButton("+500") { changeDelay(500L) }
+        )
+        hint(col, "Temps que espera abans de tornar al tauler. Com més curt, menys es veu l'app; si la ràdio no arrenca bé, allarga'l.")
+        overlayInfo = label("", 24f, Color.WHITE)
+        col.addView(overlayInfo)
+        addButton(col, bigButton("Permet «Mostrar sobre altres apps»") { openOverlaySettings() })
+        hint(col, "Només si el tauler no torna sol: aquest permís fa que Android ho permeti.")
+        returnInfo = label("", 22f, Pal.GRAY)
+        col.addView(returnInfo)
 
         // --- Viatge
         header(col, "Viatge")
@@ -475,6 +568,7 @@ class MainActivity : Activity(), SensorEventListener {
         addButton(col, bigButton("Demana el permís d'ubicació") { ensureGps() })
         addButton(col, bigButton("Atura el GPS i tanca l'app") {
             GpsHub.persist()
+            SpeedAlert.release()
             stopService(Intent(this, GpsService::class.java))
             finishAndRemoveTask()
         })
@@ -486,10 +580,26 @@ class MainActivity : Activity(), SensorEventListener {
         })
         hint(col, "Per veure quines tecles del volant arriben a l'app. Per tornar, fes servir el botó de tornar de la unitat.")
 
-        val ver = label("Tauler cotxe 0.2", 18f, Pal.GRAY)
+        val ver = label("Tauler cotxe Beta 2", 18f, Pal.GRAY)
         ver.setPadding(0, dp(24f), 0, 0)
         col.addView(ver)
         return sv
+    }
+
+    private fun changeDelay(delta: Long) {
+        Prefs.returnDelayMs = Prefs.returnDelayMs + delta
+        refreshSettings()
+    }
+
+    private fun openOverlaySettings() {
+        try {
+            startActivity(
+                Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, Uri.parse("package:$packageName"))
+                    .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            )
+        } catch (e: Exception) {
+            Toast.makeText(this, "Aquesta unitat no obre aquesta pantalla: ${e.message}", Toast.LENGTH_LONG).show()
+        }
     }
 
     private fun onOff(v: Boolean) = if (v) "sí" else "no"
@@ -506,15 +616,17 @@ class MainActivity : Activity(), SensorEventListener {
         for (i in slotRowButtons.indices) {
             slotRowButtons[i].text = appLabel(Prefs.slotPkg(i), Prefs.slotCls(i))
         }
-        swapBtn.text = "Eixos intercanviats: " + onOff(Prefs.accSwap)
-        invFwdBtn.text = "Inverteix accelera/frena: " + onOff(Prefs.accInvFwd)
-        invLatBtn.text = "Inverteix esquerra/dreta: " + onOff(Prefs.accInvLat)
+        alertInfo.text = "Llindar: " + Fmt.num(Prefs.alertKmh, 0) + " km/h"
+        alertBtn.text = "Avís de velocitat activat: " + onOff(Prefs.alertOn)
+        delayInfo.text = "Retard abans de tornar: " + Prefs.returnDelayMs + " ms"
+        overlayInfo.text = "«Mostrar sobre altres apps»: " + (if (Settings.canDrawOverlays(this)) "permès" else "no permès")
+        returnInfo.text = "Últim retorn al tauler: " + Returner.lastResult
         gpsInfo.text = GpsHub.statusLabel() + " — satèl·lits " + GpsHub.satsUsed + "/" + GpsHub.satsVisible +
             "   Servei: " + (if (GpsHub.serviceRunning) "actiu" else "aturat")
     }
 
     private companion object {
         const val REQ_LOCATION = 1
-        const val TAB_SETTINGS = 3
+        const val TAB_SETTINGS = 2
     }
 }

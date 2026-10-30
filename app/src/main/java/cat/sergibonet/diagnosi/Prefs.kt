@@ -8,6 +8,9 @@ object Prefs {
     const val SLOTS = 6
     val SLOT_NAMES = arrayOf("Telèfon", "Ràdio", "Música local", "Navegador", "Música mòbil", "Android Auto")
 
+    /** Botons que amb un toc curt obren l'app i tornen enseguida al tauler (l'àudio continua). */
+    val RETURN_SLOTS = setOf(1, 2, 4)
+
     private var sp: SharedPreferences? = null
 
     private fun p(): SharedPreferences =
@@ -45,34 +48,23 @@ object Prefs {
         p().edit().putString("slot${i}_pkg", pkg).putString("slot${i}_cls", cls).apply()
     }
 
-    // ---------------------------------------------------------------- acceleròmetre
-    var accSwap: Boolean
-        get() = p().getBoolean("acc_swap", false)
+    /** Retard (ms) abans de tornar al tauler després d'obrir una app amb toc curt. */
+    var returnDelayMs: Long
+        get() = p().getLong("return_delay", 1500L).coerceIn(300L, 6000L)
         set(v) {
-            p().edit().putBoolean("acc_swap", v).apply()
+            p().edit().putLong("return_delay", v.coerceIn(300L, 6000L)).apply()
         }
 
-    var accInvFwd: Boolean
-        get() = p().getBoolean("acc_inv_fwd", false)
+    // ---------------------------------------------------------------- avís de velocitat
+    var alertOn: Boolean
+        get() = p().getBoolean("alert_on", false)
         set(v) {
-            p().edit().putBoolean("acc_inv_fwd", v).apply()
+            p().edit().putBoolean("alert_on", v).apply()
         }
 
-    var accInvLat: Boolean
-        get() = p().getBoolean("acc_inv_lat", false)
-        set(v) {
-            p().edit().putBoolean("acc_inv_lat", v).apply()
-        }
-
-    fun accRef(): DoubleArray? {
-        val s = p().getString("acc_ref", null) ?: return null
-        val parts = s.split(",").mapNotNull { it.toDoubleOrNull() }
-        return if (parts.size == 3) parts.toDoubleArray() else null
-    }
-
-    fun setAccRef(v: DoubleArray) {
-        p().edit().putString("acc_ref", "${v[0]},${v[1]},${v[2]}").apply()
-    }
+    var alertKmh: Double
+        get() = getD("alert_kmh", 130.0)
+        set(v) = putD("alert_kmh", v)
 
     // ---------------------------------------------------------------- última posició (per a la sortida del sol)
     fun lastPos(): DoubleArray? {

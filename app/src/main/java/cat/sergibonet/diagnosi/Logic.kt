@@ -5,12 +5,9 @@ import java.util.Locale
 import java.util.TimeZone
 import kotlin.math.abs
 import kotlin.math.acos
-import kotlin.math.asin
 import kotlin.math.cos
-import kotlin.math.exp
 import kotlin.math.floor
 import kotlin.math.max
-import kotlin.math.min
 import kotlin.math.pow
 import kotlin.math.sin
 import kotlin.math.sqrt
@@ -164,98 +161,33 @@ class TripCalc {
 }
 
 /**
- * Acceleròmetre: força G longitudinal i lateral, i inclinació (cabeceig i escorada).
- * Cal calibrar el nivell amb el cotxe aturat i en pla (guarda la gravetat de referència).
- * Suposa que la pantalla mira el conductor (endavant del cotxe = cap a dins de la pantalla)
- * i es pot corregir amb els tres ajustaments.
+ * Decideix quan ha de sonar l'avís de velocitat: tan bon punt es arriba al llindar
+ * i després cada 10 segons mentre es mantingui. Per sota del llindar menys 3 km/h
+ * es reinicia (així, voltant el llindar no sona a cada lectura).
  */
-class AccelCalc {
-    var swap = false
-    var invFwd = false
-    var invLat = false
+class AlertLogic {
+    private var lastBeepMs = -1L
 
-    var longG = 0.0
-        private set
-    var latG = 0.0
-        private set
-    var pitchDeg = 0.0
-        private set
-    var rollDeg = 0.0
-        private set
-    var hasRef = false
-        private set
-    var ready = false
-        private set
-
-    private val fast = DoubleArray(3)
-    private val slow = DoubleArray(3)
-    private val ref = DoubleArray(3)
-
-    fun setRef(x: Double, y: Double, z: Double) {
-        ref[0] = x
-        ref[1] = y
-        ref[2] = z
-        hasRef = true
-    }
-
-    fun refVec(): DoubleArray = ref.copyOf()
-
-    /** Desa la lectura actual (filtrada) com a "pla". */
-    fun calibrate(): Boolean {
-        if (!ready) return false
-        setRef(slow[0], slow[1], slow[2])
+    /** `true` = cal fer sonar l'avís ara. `nowMs`: rellotge monòton (ms). */
+    fun onFix(nowMs: Long, kmh: Double, enabled: Boolean, thresholdKmh: Double): Boolean {
+        if (!enabled || kmh.isNaN()) {
+            lastBeepMs = -1L
+            return false
+        }
+        if (kmh < thresholdKmh - RESET_MARGIN_KMH) {
+            lastBeepMs = -1L
+            return false
+        }
+        if (kmh < thresholdKmh) return false
+        if (lastBeepMs >= 0L && nowMs - lastBeepMs < INTERVAL_MS - TOLERANCE_MS) return false
+        lastBeepMs = nowMs
         return true
     }
 
-    fun feed(x: Double, y: Double, z: Double, dtSec: Double) {
-        if (!ready) {
-            fast[0] = x; fast[1] = y; fast[2] = z
-            slow[0] = x; slow[1] = y; slow[2] = z
-            ready = true
-        } else {
-            val af = 1.0 - exp(-dtSec / 0.25)
-            val aSlow = 1.0 - exp(-dtSec / 2.5)
-            val raw = doubleArrayOf(x, y, z)
-            for (i in 0 until 3) {
-                fast[i] += (raw[i] - fast[i]) * af
-                slow[i] += (raw[i] - slow[i]) * aSlow
-            }
-        }
-        if (!hasRef) return
-
-        val rn = sqrt(dot(ref, ref))
-        if (rn < 1.0) return
-        val up = doubleArrayOf(ref[0] / rn, ref[1] / rn, ref[2] / rn)
-        val f0 = if (swap) doubleArrayOf(1.0, 0.0, 0.0) else doubleArrayOf(0.0, 0.0, -1.0)
-        val d = dot(f0, up)
-        val f = doubleArrayOf(f0[0] - d * up[0], f0[1] - d * up[1], f0[2] - d * up[2])
-        val fn = sqrt(dot(f, f))
-        if (fn < 0.1) return
-        for (i in 0 until 3) f[i] /= fn
-        val r = cross(f, up)
-
-        val dyn = doubleArrayOf(fast[0] - slow[0], fast[1] - slow[1], fast[2] - slow[2])
-        val rel = doubleArrayOf(slow[0] - ref[0], slow[1] - ref[1], slow[2] - ref[2])
-        val sf = if (invFwd) -1.0 else 1.0
-        val sl = if (invLat) -1.0 else 1.0
-        longG = sf * dot(dyn, f) / G
-        latG = sl * dot(dyn, r) / G
-        pitchDeg = sf * Math.toDegrees(asin(clamp1(dot(rel, f) / G)))
-        rollDeg = -sl * Math.toDegrees(asin(clamp1(dot(rel, r) / G)))
-    }
-
-    private fun clamp1(v: Double): Double = min(1.0, max(-1.0, v))
-
-    private fun dot(a: DoubleArray, b: DoubleArray) = a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
-
-    private fun cross(a: DoubleArray, b: DoubleArray) = doubleArrayOf(
-        a[1] * b[2] - a[2] * b[1],
-        a[2] * b[0] - a[0] * b[2],
-        a[0] * b[1] - a[1] * b[0]
-    )
-
     companion object {
-        const val G = 9.80665
+        const val INTERVAL_MS = 10000L
+        const val TOLERANCE_MS = 400L
+        const val RESET_MARGIN_KMH = 3.0
     }
 }
 
